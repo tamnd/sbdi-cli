@@ -2,7 +2,6 @@ package sbdi
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +18,6 @@ import (
 // sbdi:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone sbdi binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the sbdi driver. It carries no state; the per-run client is
@@ -36,36 +32,29 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "sbdi",
-			Short:  "A command line for sbdi.",
-			Long: `A command line for sbdi.
+			Short:  "Read Swedish Biodiversity Data Infrastructure occurrence records.",
+			Long: `Read 175M+ biodiversity occurrence records from SBDI (biodiversitydata.se).
 
-sbdi reads public sbdi data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+sbdi reads species observations, museum specimens, and field survey data from
+Swedish institutions. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/sbdi-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `sbdi page` and
-	// `ant get sbdi://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: text search across occurrences
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search SBDI occurrence records by taxon, keyword (--limit, --offset)",
+		Args:    []kit.Arg{{Name: "query", Help: "taxon name or keyword"}}}, searchOccurrences)
 
-	// List op: members of a page, the home of `sbdi links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// sbdi://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// recent: most recent occurrences (q=*, sorted by date)
+	kit.Handle(app, kit.OpMeta{Name: "recent", Group: "read", List: true,
+		Summary: "List recent SBDI occurrences (--limit)"}, recentOccurrences)
 }
 
 // newClient builds the client from the host-resolved config, so a host and the
@@ -73,101 +62,92 @@ func (Domain) Register(app *kit.App) {
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"          help:"taxon name or keyword"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Offset int     `kit:"flag"         help:"result offset"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type recentInput struct {
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOccurrences(ctx context.Context, in searchInput, emit func(*Occurrence) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	results, _, err := in.Client.SearchOccurrences(ctx, in.Query, limit, in.Offset)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, o := range results {
+		if err := emit(o); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full sbdi.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized sbdi reference: %q", input)
+func recentOccurrences(ctx context.Context, in recentInput, emit func(*Occurrence) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return "page", id, nil
+	results, _, err := in.Client.SearchOccurrences(ctx, "*", limit, 0)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, o := range results {
+		if err := emit(o); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Classify turns any accepted input into the canonical (type, id).
+// Any non-empty string is treated as an occurrence ID.
+func (Domain) Classify(input string) (string, string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty SBDI reference")
+	}
+	return "occurrence", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "occurrence":
+		return "https://records.biodiversitydata.se/occurrences/" + id, nil
+	default:
 		return "", errs.Usage("sbdi has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
