@@ -1,0 +1,10 @@
+title       = "sbdi"
+baseURL     = "https://sbdi-cli.tamnd.com/"
+description = "A command line for sbdi."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/sbdi-cli"
